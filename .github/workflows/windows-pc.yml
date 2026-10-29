@@ -1,0 +1,107 @@
+# «Чистый Xiaomi» для Windows: Flutter desktop + bundled adb (platform-tools) + Inno Setup installer.
+# Flutter cannot cross-compile Windows desktop apps, so this runs on windows-latest.
+# Output: workflow artifact "cleaner-windows" (Setup exe + SHA256). Nothing is published from CI.
+name: windows-pc
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  FLUTTER_VERSION: "3.47.7"
+  PT_URL: "https://dl.google.com/android/repository/platform-tools_r37.0.1-win.zip"
+  PT_SHA256: "45f4d63113e895ebde0c90f194099a4676b6ac653bd28d54314a9e022bbc1a99"
+  INNO_URL: "https://github.com/jrsoftware/issrc/releases/download/is-7_1_0/innosetup-7.1.0-x64.exe"
+  INNO_SHA256: "0362a383ed217d4c4239b5933866dd96d3eb2102737da92f80f6057a4b40df2f"
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Version
+        id: ver
+        run: |
+          $line = (Select-String -Path pc/pubspec.yaml -Pattern '^version:\s*(\S+)').Matches[0].Groups[1].Value
+          $name, $build = $line -split '\+'
+          "name=$name"   >> $env:GITHUB_OUTPUT
+          "build=$build" >> $env:GITHUB_OUTPUT
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Flutter analyze + test + build
+        working-directory: pc
+        run: |
+          flutter pub get
+          flutter analyze --no-fatal-infos
+          flutter test test/logic_test.dart
+          flutter build windows --release --build-name=${{ steps.ver.outputs.name }} --build-number=${{ steps.ver.outputs.build }}
+
+      - name: Stage dist
+        run: |
+          New-Item -ItemType Directory -Force dist/adb | Out-Null
+          Copy-Item -Recurse pc/build/windows/x64/runner/Release/* dist/
+          # Flutter's runner links the MSVC runtime dynamically; ship it app-local so no VC++ redist is needed
+          foreach ($d in 'msvcp140.dll','vcruntime140.dll','vcruntime140_1.dll') { Copy-Item "$env:WINDIR\System32\$d" dist/ }
+          Copy-Item LICENSE dist/LICENSE.txt
+          Copy-Item THIRD_PARTY_NOTICES.md dist/THIRD_PARTY_NOTICES.md
+
+      - name: Fetch Android platform-tools (pinned, checksum verified)
+        run: |
+          $zip = "$env:RUNNER_TEMP\pt.zip"
+          Invoke-WebRequest $env:PT_URL -OutFile $zip
+          if ((Get-FileHash $zip -Algorithm SHA256).Hash -ne $env:PT_SHA256) { throw "platform-tools checksum mismatch" }
+          Expand-Archive $zip "$env:RUNNER_TEMP\pt"
+          Copy-Item "$env:RUNNER_TEMP\pt\platform-tools\adb.exe","$env:RUNNER_TEMP\pt\platform-tools\AdbWinApi.dll","$env:RUNNER_TEMP\pt\platform-tools\AdbWinUsbApi.dll" dist/adb/
+          Copy-Item "$env:RUNNER_TEMP\pt\platform-tools\NOTICE.txt" dist/adb/NOTICE.txt
+          & dist/adb/adb.exe version
+          Get-ChildItem -Recurse dist | Select-Object FullName, Length | Format-Table -AutoSize
+
+      - name: Install Inno Setup 7.1 (pinned, checksum verified)
+        run: |
+          $exe = "$env:RUNNER_TEMP\is.exe"
+          Invoke-WebRequest $env:INNO_URL -OutFile $exe
+          if ((Get-FileHash $exe -Algorithm SHA256).Hash -ne $env:INNO_SHA256) { throw "Inno Setup checksum mismatch" }
+          Start-Process $exe -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/CURRENTUSER',"/DIR=$env:RUNNER_TEMP\IS" -Wait
+
+      - name: Build installer
+        working-directory: pc
+        run: |
+          & "$env:RUNNER_TEMP\IS\ISCC.exe" /Q "/DAppVersion=${{ steps.ver.outputs.name }}" "/DDist=$env:GITHUB_WORKSPACE\dist" "/DOutDir=$env:GITHUB_WORKSPACE\out" installer\cleaner.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
+          Get-ChildItem ../out/*.exe | ForEach-Object { "{0}  {1}" -f (Get-FileHash $_ -Algorithm SHA256).Hash.ToLower(), $_.Name } | Set-Content ../out/SHA256.txt
+          Get-Content ../out/SHA256.txt
+
+      - name: Smoke test install (silent, per-user)
+        run: |
+          $setup = (Get-ChildItem out/ChistyXiaomi-Setup-*.exe).FullName
+          Start-Process $setup -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART' -Wait
+          $app = "$env:LOCALAPPDATA\Programs\ChistyXiaomi"
+          foreach ($f in 'ChistyXiaomi.exe','flutter_windows.dll','adb\adb.exe','adb\AdbWinApi.dll','adb\AdbWinUsbApi.dll','vcruntime140.dll') {
+            if (-not (Test-Path "$app\$f")) { throw "missing $f" }
+          }
+          & "$app\adb\adb.exe" version
+          $p = Start-Process "$app\ChistyXiaomi.exe" -PassThru
+          Start-Sleep 8
+          if ($p.HasExited) { throw "app exited early with code $($p.ExitCode)" }
+          Stop-Process $p -Force
+          & "$app\adb\adb.exe" kill-server
+          Start-Process "$app\unins000.exe" -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART' -Wait
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cleaner-windows
+          path: out/*
+          if-no-files-found: error
